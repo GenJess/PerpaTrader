@@ -4,11 +4,45 @@ import { ArrowUpCircle, ArrowDownCircle, RefreshCcw, Flag } from 'lucide-react';
 import { cn, formatPrice, formatPercentChange, formatTimestamp } from '../lib/utils';
 import { cryptoWebSocket } from '../lib/websocket';
 
+/**
+ * Defines the structure of ticker messages received from the WebSocket,
+ * specific to the data consumed by `CryptoCard`.
+ * @property product_id - The product identifier (e.g., "BTC-USD").
+ * @property price - The current price as a string.
+ * @property time - The timestamp of the data point in ISO 8601 format.
+ * @property volume_24h - Optional: The trading volume over the last 24 hours as a string.
+ * @property low_24h - Optional: The lowest price in the last 24 hours as a string.
+ * @property high_24h - Optional: The highest price in the last 24 hours as a string.
+ * @property open_24h - Optional: The opening price from 24 hours ago as a string.
+ */
+interface CoinbaseTickerMessage {
+  product_id: string;
+  price: string;
+  time: string;
+  volume_24h?: string;
+  low_24h?: string;
+  high_24h?: string;
+  open_24h?: string;
+}
+
+/**
+ * Props for the `CryptoCard` component.
+ * @property symbol - The cryptocurrency symbol (e.g., "btc", "eth").
+ * @property name - The display name of the cryptocurrency (e.g., "Bitcoin", "Ethereum").
+ */
 interface CryptoCardProps {
   symbol: string;
   name: string;
 }
 
+/**
+ * Represents the processed and displayable data for a cryptocurrency.
+ * @property currentPrice - The current price of the cryptocurrency.
+ * @property change24h - The percentage change in price over the last 24 hours.
+ * @property volume24h - The trading volume over the last 24 hours.
+ * @property high24h - The highest price in the last 24 hours.
+ * @property low24h - The lowest price in the last 24 hours.
+ */
 interface CryptoData {
   currentPrice: number;
   change24h: number;
@@ -17,26 +51,72 @@ interface CryptoData {
   low24h: number;
 }
 
+/**
+ * Represents a single data point for the price history chart.
+ * @property timestamp - The Unix timestamp (in milliseconds) of the data point.
+ * @property price - The price at that specific timestamp.
+ */
 interface ChartDataPoint {
   timestamp: number;
   price: number;
 }
 
+/**
+ * Represents the state of a marked price point for tracking changes.
+ * @property price - The price at which the point was marked.
+ * @property timestamp - The Unix timestamp (in milliseconds) when the point was marked.
+ * @property percentChange - The percentage change in price since the point was marked.
+ */
 interface MarkedChange {
   price: number;
   timestamp: number;
   percentChange: number;
 }
 
+/**
+ * Defines the structure for storing marked price point information in `localStorage`.
+ * @property price - The price at which the point was marked.
+ * @property timestamp - The Unix timestamp (in milliseconds) when the point was marked.
+ */
+interface StoredMarkedInfo {
+  price: number;
+  timestamp: number;
+}
+
+/**
+ * `CryptoCard` is a React functional component that displays real-time information
+ * for a single cryptocurrency. It includes current price, 24-hour statistics,
+ * a historical price chart, and a feature to mark a price point for change tracking.
+ * Data is received via a WebSocket connection and persisted states (like marked price)
+ * are stored in `localStorage`.
+ *
+ * @param {CryptoCardProps} props - The props for the component, including `symbol` and `name`.
+ */
 const CryptoCard: React.FC<CryptoCardProps> = ({ symbol, name }) => {
+  /** Key used for storing and retrieving this crypto's marked point from localStorage. */
+  const localStorageKey = `markedChange_${symbol.toUpperCase()}`;
+
+  /** State for the current processed cryptocurrency data. */
   const [data, setData] = useState<CryptoData | null>(null);
+  /** State for the historical price data points for the chart. */
   const [chartData, setChartData] = useState<ChartDataPoint[]>([]);
+  /** State to manage the initial loading visual state. */
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  // const [error, setError] = useState<string | null>(null); // setError was unused
+  /** State for the user-marked price point. */
   const [markedChange, setMarkedChange] = useState<MarkedChange | null>(null);
+  /** State to manage the loading/disabled status of the "Mark Start Point" button. */
   const [isMarking, setIsMarking] = useState(false);
 
-  const handleWebSocketData = useCallback((wsData: any) => {
+  /**
+   * Callback function to process incoming WebSocket messages for the subscribed cryptocurrency.
+   * It updates the component's state with the new price, volume, and other relevant data.
+   * It also updates the chart data and recalculates the percentage change from any marked point.
+   *
+   * This function is memoized using `useCallback` to prevent unnecessary re-renders.
+   * @param {CoinbaseTickerMessage} wsData - The ticker data received from the WebSocket.
+   */
+  const handleWebSocketData = useCallback((wsData: CoinbaseTickerMessage) => {
     const price = parseFloat(wsData.price);
     const timestamp = new Date(wsData.time).getTime();
     
@@ -87,14 +167,56 @@ const CryptoCard: React.FC<CryptoCardProps> = ({ symbol, name }) => {
     };
   }, [symbol, handleWebSocketData]);
 
+  // Effect to load markedChange from localStorage on mount
+  /**
+   * `useEffect` hook to load a previously marked price point from `localStorage`
+   * when the component mounts. This allows persistence of the marked point across sessions.
+   */
+  useEffect(() => {
+    try {
+      const storedData = localStorage.getItem(localStorageKey);
+      if (storedData) {
+        const parsedData: StoredMarkedInfo = JSON.parse(storedData);
+        // Basic validation of the parsed data
+        if (parsedData && typeof parsedData.price === 'number' && typeof parsedData.timestamp === 'number') {
+          // Set the loaded data. percentChange will be calculated by handleWebSocketData
+          // once current price is available.
+          setMarkedChange({
+            price: parsedData.price,
+            timestamp: parsedData.timestamp,
+            percentChange: 0 // Initialize with 0, will be updated
+          });
+        } else {
+          console.warn(`Invalid stored marked data for ${symbol}:`, parsedData);
+          localStorage.removeItem(localStorageKey); // Remove invalid data
+        }
+      }
+    } catch (error) {
+      console.error(`Error loading markedChange for ${symbol} from localStorage:`, error);
+    }
+  }, [localStorageKey, symbol]);
+
+  /**
+   * Handles the action of marking a new start point for price change tracking.
+   * It captures the current price and timestamp, updates the `markedChange` state,
+   * and saves this information to `localStorage`.
+   */
   const markStartPoint = () => {
     setIsMarking(true);
     if (data) {
-      setMarkedChange({
+      const newMark: MarkedChange = {
         price: data.currentPrice,
         timestamp: Date.now(),
-        percentChange: 0
-      });
+        percentChange: 0 // Will be immediately recalculated if data.currentPrice is the same, or by next tick
+      };
+      setMarkedChange(newMark);
+
+      try {
+        const dataToStore: StoredMarkedInfo = { price: newMark.price, timestamp: newMark.timestamp };
+        localStorage.setItem(localStorageKey, JSON.stringify(dataToStore));
+      } catch (error) {
+        console.error(`Error saving markedChange for ${symbol} to localStorage:`, error);
+      }
     }
     setIsMarking(false);
   };
